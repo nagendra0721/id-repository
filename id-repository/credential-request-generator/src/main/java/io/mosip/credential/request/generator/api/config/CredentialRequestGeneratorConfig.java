@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosip.idrepository.core.helper.RestHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springdoc.core.models.GroupedOpenApi;
@@ -27,6 +28,9 @@ import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.info.Info;
 import io.swagger.v3.oas.models.info.License;
 import io.swagger.v3.oas.models.servers.Server;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.security.task.DelegatingSecurityContextAsyncTaskExecutor;
+import org.springframework.web.reactive.function.client.WebClient;
 
 @Configuration
 @EnableJpaRepositories(entityManagerFactoryRef = "entityManagerFactory", basePackages = "io.mosip.credential.request.generator.repositary.*", repositoryBaseClass = HibernateRepositoryImpl.class, excludeFilters = {
@@ -83,5 +87,25 @@ public class CredentialRequestGeneratorConfig extends HibernateDaoConfig {
 	public RestRequestBuilder getRestRequestBuilder() {
 		return new RestRequestBuilder(Arrays.stream(RestServicesConstants.values())
 				.map(RestServicesConstants::getServiceName).collect(Collectors.toList()));
+	}
+
+	@Bean
+	public RestHelper restHelper(@Qualifier("selfTokenWebClient") WebClient webClient) {
+		return new RestHelper(webClient);
+	}
+
+	/**
+	 * Default async executor for @Async methods (e.g. RestHelper.requestAsync).
+	 * Wraps a ThreadPoolTaskExecutor with DelegatingSecurityContextAsyncTaskExecutor
+	 * so the Spring Security context is propagated to async threads. Without this,
+	 * the WebClient auth filter (BeanConfig) cannot obtain the token in the async
+	 * thread and throws "ClientRequest must not be null".
+	 */
+	@Bean("taskExecutor")
+	public DelegatingSecurityContextAsyncTaskExecutor asyncTaskExecutor() {
+		ThreadPoolTaskExecutor delegate = new ThreadPoolTaskExecutor();
+		delegate.setThreadNamePrefix("credreq-async-");
+		delegate.initialize();
+		return new DelegatingSecurityContextAsyncTaskExecutor(delegate);
 	}
 }

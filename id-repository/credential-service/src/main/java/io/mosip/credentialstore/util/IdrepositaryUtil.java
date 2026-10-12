@@ -42,7 +42,6 @@ public class IdrepositaryUtil {
 
 	private static final Logger LOGGER = IdRepoLogger.getLogger(IdrepositaryUtil.class);
 
-
 	public IdResponseDTO getData(CredentialServiceRequestDto credentialServiceRequestDto,
 								 Map<String, String> bioAttributeFormatterMap)
 			throws ApiNotAccessibleException, IdRepoException, JsonParseException, JsonMappingException, IOException {

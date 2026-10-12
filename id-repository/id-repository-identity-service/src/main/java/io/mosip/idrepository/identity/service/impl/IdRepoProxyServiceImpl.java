@@ -12,6 +12,9 @@ import java.io.IOException;
 import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 import jakarta.annotation.Resource;
@@ -146,6 +149,10 @@ public class IdRepoProxyServiceImpl implements IdRepoService<IdRequestDTO, IdRes
 
 	@Value("${id-repo-ida-event-type-name:ida}")
 	private String idaEventTypeName;
+
+	/** Total seconds to wait for all modality extractions to complete. */
+	@Value("${mosip.idrepo.bio.extraction.timeout-seconds:30}")
+	private long extractionTimeoutSeconds;
 
 	/*
 	 * (non-Javadoc)
@@ -443,10 +450,29 @@ public class IdRepoProxyServiceImpl implements IdRepoService<IdRequestDTO, IdRes
 				}
 			}
 
-			CompletableFuture.allOf(extractionFutures.toArray(new CompletableFuture<?>[extractionFutures.size()]))
-					.join();
+			originalBirs.clear(); // release parsed BIR list before blocking on futures - reduces live set during wait
+
+			// Wait for all modality extractions with a hard deadline.
+			// Previously .join() was used with no timeout, blocking indefinitely.
+			// Now .get(timeout) bounds the wait to mosip.idrepo.bio.extraction.timeout-seconds.
+			try {
+				CompletableFuture.allOf(extractionFutures.toArray(new CompletableFuture<?>[0]))
+						.get(extractionTimeoutSeconds, TimeUnit.SECONDS);
+			} catch (TimeoutException e) {
+				extractionFutures.forEach(f -> f.cancel(true));
+				mosipLogger.error(IdRepoSecurityManager.getUser(), ID_REPO_SERVICE_IMPL, "extractTemplate",
+						"Biometric extraction timed out after " + extractionTimeoutSeconds + "s");
+				throw new IdRepoAppUncheckedException(BIO_EXTRACTION_ERROR, e);
+			} catch (ExecutionException e) {
+				Throwable cause = e.getCause();
+				if (cause instanceof IdRepoAppUncheckedException)
+					throw (IdRepoAppUncheckedException) cause;
+				throw new IdRepoAppUncheckedException(BIO_EXTRACTION_ERROR, cause);
+			}
+			// All futures completed normally; getNow() retrieves without a second blocking call
+			// (replaces the previous redundant future.get() loop after the join).
 			for (CompletableFuture<List<BIR>> future : extractionFutures) {
-				finalBirs.addAll(future.get());
+				finalBirs.addAll(future.getNow(Collections.emptyList()));
 			}
 
 			return cbeffUtil.createXML(finalBirs);
@@ -544,6 +570,44 @@ public class IdRepoProxyServiceImpl implements IdRepoService<IdRequestDTO, IdRes
 			mosipLogger.error(IdRepoSecurityManager.getUser(), ID_REPO_SERVICE_IMPL, "retrieveRidByUin",
 					"NO_RECORD_FOUND");
 			throw new IdRepoAppException(NO_RECORD_FOUND);
+		}
+	}
+
+	/**
+	 * Retrieves the id vid metadata information for a given individual
+	 * based on the provided ID and its type.
+	 *
+	 * @param individualId the identifier of the individual whose metadata is to be fetched.
+	 * @param idType The type of ID that you're passing in.
+	 * @return an {@code IdVidMetaDataResponseDTO} containing rid, createdOn, and updatedOn
+	 * @throws IdRepoAppException if there is an error during retrieval
+	 */
+	public IdVidMetadataResponseDTO getIdVidMetadata(String individualId, IdType idType) throws IdRepoAppException {
+		try {
+			switch (idType) {
+				case VID:
+					individualId = getUinByVid(individualId);
+				case UIN:
+					String uinHash = retrieveUinHash(individualId);
+					Optional<Uin> uin = uinRepo.findByUinHash(uinHash);
+					if (uin.isPresent()) {
+						return getIdVidMetadataResponseDTO(uin.get());
+					}
+					break;
+				case ID:
+					Optional<Uin> uinOptional = uinRepo.findByRegId(individualId);
+					if (uinOptional.isPresent()) {
+						return getIdVidMetadataResponseDTO(uinOptional.get());
+					}
+					break;
+			}
+			mosipLogger.error(IdRepoSecurityManager.getUser(), ID_REPO_SERVICE_IMPL, "getIdVidMetadata",
+					"NO_RECORD_FOUND");
+			throw new IdRepoAppException(NO_RECORD_FOUND);
+		} catch (DataAccessException e) {
+			mosipLogger.error(IdRepoSecurityManager.getUser(), ID_REPO_SERVICE_IMPL,
+					"getIdVidMetadata", "DATABASE_ERROR");
+			throw new IdRepoAppException(DATABASE_ACCESS_ERROR);
 		}
 	}
 
@@ -751,5 +815,17 @@ public class IdRepoProxyServiceImpl implements IdRepoService<IdRequestDTO, IdRes
 					: ((IdRepoAppUncheckedException) e).getErrorText();
 			throw new IdRepoAppException(errorCode, errorMsg, e);
 		}
+	}
+
+	private IdVidMetadataResponseDTO getIdVidMetadataResponseDTO(Uin uin) {
+		IdVidMetadataResponseDTO metadataResponseDTO = new IdVidMetadataResponseDTO();
+		metadataResponseDTO.setRid(uin.getRegId());
+		if (uin.getUpdatedDateTime() != null) {
+			metadataResponseDTO.setUpdatedOn(DateUtils2.formatToISOString(uin.getUpdatedDateTime()));
+		}
+		if (uin.getCreatedDateTime() != null) {
+			metadataResponseDTO.setCreatedOn(DateUtils2.formatToISOString(uin.getCreatedDateTime()));
+		}
+		return metadataResponseDTO;
 	}
 }
